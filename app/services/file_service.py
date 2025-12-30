@@ -4,7 +4,7 @@ import os
 import time
 import logging
 from typing import List, Callable, Optional
-from pydub import AudioSegment, exceptions as pydub_exceptions
+from pydub import AudioSegment, exceptions as pydub_exceptions, utils as pydub_utils
 
 ALLOWED_EXTENSIONS = {'mp3', 'm4a', 'wav', 'ogg', 'webm'}
 # Constant for chunk length: 10 minutes in milliseconds
@@ -32,10 +32,44 @@ def split_audio_file(file_path: str, temp_dir: str,
     """Splits an audio file into chunks, reporting progress via callback."""
     base_name_orig = os.path.basename(file_path)
 
+    if not os.path.isfile(file_path):
+        msg = f"ERROR: Audio file not found at '{file_path}'"
+        if progress_callback:
+            progress_callback(msg, True)
+        logging.error(f"[SYSTEM] {msg}")
+        return []
+
+    if not (pydub_utils.which("ffmpeg") or pydub_utils.which("avconv")):
+        try:
+            import imageio_ffmpeg
+            AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
+            if progress_callback:
+                progress_callback("Using bundled ffmpeg binary from imageio-ffmpeg.", False)
+        except Exception as exc:
+            msg = "ERROR: ffmpeg not found. Install ffmpeg or pip install imageio-ffmpeg."
+            if progress_callback:
+                progress_callback(msg, True)
+            logging.error(f"[SYSTEM] {msg} Details: {exc}")
+            return []
+
     try:
         # Add explicit logging for pydub loading attempt (console only)
         logging.info(f"[SYSTEM] Loading audio file '{base_name_orig}' for splitting...")
-        audio = AudioSegment.from_file(file_path)
+        has_ffprobe = pydub_utils.which("ffprobe") or pydub_utils.which("avprobe")
+        file_ext = os.path.splitext(file_path)[1].lower().lstrip(".")
+        if has_ffprobe:
+            audio = AudioSegment.from_file(file_path)
+        elif file_ext == "mp3":
+            audio = AudioSegment.from_file(file_path, format="mp3", codec="mp3")
+        else:
+            msg = (
+                "ERROR: ffprobe is required to read metadata for this file type. "
+                "Install ffprobe (part of ffmpeg) or use an .mp3 file."
+            )
+            if progress_callback:
+                progress_callback(msg, True)
+            logging.error(f"[SYSTEM] {msg}")
+            return []
         logging.info(f"[SYSTEM] Successfully loaded '{base_name_orig}'. Duration: {len(audio) / 1000:.2f}s")
     except pydub_exceptions.CouldntDecodeError as cde:
         # SIMPLE UI ERROR MESSAGE
@@ -43,9 +77,9 @@ def split_audio_file(file_path: str, temp_dir: str,
         if progress_callback: progress_callback(msg, True)
         logging.error(f"[SYSTEM] {msg} Details: {cde}") # Console log with details
         return []
-    except FileNotFoundError:
+    except FileNotFoundError as fnf:
         # SIMPLE UI ERROR MESSAGE
-        msg = f"ERROR: Audio file not found at '{file_path}'"
+        msg = f"ERROR: Failed to process audio file '{base_name_orig}': {fnf}. Is ffmpeg installed?"
         if progress_callback: progress_callback(msg, True)
         logging.error(f"[SYSTEM] {msg}") # Console log
         return []
@@ -57,9 +91,44 @@ def split_audio_file(file_path: str, temp_dir: str,
         return []
 
     total_length = len(audio)
+    if total_length <= 0:
+        msg = f"ERROR: Audio file '{base_name_orig}' has no duration."
+        if progress_callback:
+            progress_callback(msg, True)
+        logging.error(f"[SYSTEM] {msg}")
+        return []
+
+    try:
+        file_size = os.path.getsize(file_path)
+    except OSError as exc:
+        msg = f"ERROR: Could not read file size for '{base_name_orig}': {exc}"
+        if progress_callback:
+            progress_callback(msg, True)
+        logging.error(f"[SYSTEM] {msg}")
+        return []
+
+    effective_chunk_length_ms = chunk_length_ms
+    if file_size > OPENAI_MAX_FILE_SIZE:
+        bytes_per_ms = file_size / total_length
+        safe_chunk_bytes = int(OPENAI_MAX_FILE_SIZE * 0.9)
+        max_chunk_length_ms = int(safe_chunk_bytes / bytes_per_ms)
+        if max_chunk_length_ms <= 0:
+            msg = f"ERROR: Computed chunk length is too small for '{base_name_orig}'."
+            if progress_callback:
+                progress_callback(msg, True)
+            logging.error(f"[SYSTEM] {msg}")
+            return []
+        if max_chunk_length_ms < effective_chunk_length_ms:
+            effective_chunk_length_ms = max_chunk_length_ms
+            if progress_callback:
+                seconds = max(1, int(effective_chunk_length_ms / 1000))
+                progress_callback(
+                    f"Adjusted chunk length to {seconds}s to stay within API size limits.",
+                    False
+                )
     chunk_files = []
     chunk_index = 1
-    num_chunks = (total_length + chunk_length_ms - 1) // chunk_length_ms # Calculate total chunks
+    num_chunks = (total_length + effective_chunk_length_ms - 1) // effective_chunk_length_ms # Calculate total chunks
 
     base_name_no_ext = os.path.splitext(base_name_orig)[0]
 
@@ -67,9 +136,9 @@ def split_audio_file(file_path: str, temp_dir: str,
         # SIMPLE UI MESSAGE
         progress_callback(f"Splitting into {num_chunks} chunks...", False)
 
-    for i in range(0, total_length, chunk_length_ms):
+    for i in range(0, total_length, effective_chunk_length_ms):
         start_ms = i
-        end_ms = min(i + chunk_length_ms, total_length)
+        end_ms = min(i + effective_chunk_length_ms, total_length)
         chunk = audio[start_ms:end_ms]
 
         chunk_filename_base = f"{base_name_no_ext}_chunk_{chunk_index}.mp3"

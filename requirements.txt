@@ -4,3 +4,4 @@ openai
 python-dotenv
 pydub
 python-docx
+imageio-ffmpeg

@@ -39,3 +39,6 @@ Thumbs.db
 database/*.db
 uploads/
 transcriptions/
+
+/output/*
+/resources/*

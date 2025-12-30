@@ -192,6 +192,10 @@ def transcribe_one(
     correction_chunk_words: int,
     no_correction: bool,
 ) -> bool:
+    if os.path.exists(output_path):
+        print(f"Skipping: output already exists: {output_path}", flush=True)
+        return True
+
     if not os.path.isfile(audio_path):
         print(f"ERROR: Audio file not found: {audio_path}", file=sys.stderr)
         return False
